@@ -4,6 +4,19 @@
 #include <cuda_fp16.h>
 #include <iostream>
 
+/*
+IMPORTANT LESSONS
+1. cudnnConvolutionForward can only work with float alpha and beta when using __half
+2. cublasGemmStridedBatchedEx can only work with __half alpha and beta when using __half
+*/
+
+/*
+TODO
+0. Add attention
+1. Optimize using << and storing bytes
+2. Add more convolution before attention
+*/
+
 void PrintMatrixF16(__half* arr, uint32_t rows, uint32_t cols, const char* label)
 {
 	printf("%s:\n", label);
@@ -63,100 +76,104 @@ int main()
 	const uint32_t STRIDE = 4;
 	const uint32_t DILATION = 1;
 
-	__half* gpuVec1;
-	__half* gpuVec2;
-	__half* gpuInput;
-	__half* gpuFilter;
-	__half* gpuOutput;
+	const uint32_t ATTENTION_DIMENTION = 8;
 	
-	cudaMalloc(&gpuVec1, INPUT_ROWS * sizeof(__half));
-	cudaMalloc(&gpuVec2, INPUT_COLS * sizeof(__half));
-	cudaMalloc(&gpuInput, INPUT_COLS * INPUT_ROWS * INPUT_CHANNELS * sizeof(__half));
-	cudaMalloc(&gpuFilter, FILTER_COLS * FILTER_ROWS * INPUT_CHANNELS * OUTPUT_CHANNELS * sizeof(__half));
-	cudaMalloc(&gpuOutput, OUTPUT_COLS * OUTPUT_ROWS * OUTPUT_CHANNELS * sizeof(__half));
-
-	__half* cpuVec1 = new __half[INPUT_ROWS];
-	__half* cpuVec2 = new __half[INPUT_COLS];
-	__half* cpuInput = new __half[INPUT_COLS * INPUT_ROWS * INPUT_CHANNELS];
-	__half* cpuFilter = new __half[FILTER_COLS * FILTER_ROWS * INPUT_CHANNELS * OUTPUT_CHANNELS];
-	__half* cpuOutput = new __half[OUTPUT_COLS * OUTPUT_ROWS * OUTPUT_CHANNELS];
-
-	CurandGenerateUniformF16(curandGenerator, gpuVec1, INPUT_ROWS);
-	CurandGenerateUniformF16(curandGenerator, gpuVec2, INPUT_COLS);
-	CurandGenerateUniformF16(curandGenerator, gpuFilter, FILTER_COLS * FILTER_ROWS * INPUT_CHANNELS * OUTPUT_CHANNELS);
-
-	cudaMemcpy(cpuVec1, gpuVec1, INPUT_ROWS * sizeof(__half), cudaMemcpyDeviceToHost);
-	cudaMemcpy(cpuVec2, gpuVec2, INPUT_COLS * sizeof(__half), cudaMemcpyDeviceToHost);
-	cudaMemcpy(cpuFilter, gpuFilter, FILTER_COLS * FILTER_ROWS * INPUT_CHANNELS * OUTPUT_CHANNELS * sizeof(__half), cudaMemcpyDeviceToHost);
-
-	PrintMatrixF16(cpuVec1, INPUT_ROWS, 1, "cpuVec1");
-	PrintMatrixF16(cpuVec2, 1, INPUT_COLS, "cpuVec2");
+	const float alpha = 1.0f;
+	const float beta = 0.0f;
 	
-	const __half alphaF16 = __float2half(1.0f);
-	const __half betaF16 = __float2half(0.0f);
+	__half* gpuTensorInput;
+	__half* gpuTensorFilter;
+	__half* gpuTensorOutput;
+	__half* gpuTensorQueryWeights;
+	__half* gpuTensorQueries;
 	
-	cublasGemmStridedBatchedEx
-	(
-		cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N,
-		INPUT_COLS, INPUT_ROWS, 1,
-		&alphaF16,
-		gpuVec2, CUDA_R_16F, INPUT_COLS, INPUT_COLS,
-		gpuVec1, CUDA_R_16F, 1, INPUT_ROWS,
-		&betaF16,
-		gpuInput, CUDA_R_16F, INPUT_COLS, INPUT_ROWS * INPUT_COLS,
-		1, CUDA_R_16F, CUBLAS_GEMM_DEFAULT
-	);
+	cudaMalloc(&gpuTensorInput, INPUT_COLS * INPUT_ROWS * INPUT_CHANNELS * sizeof(__half));
+	cudaMalloc(&gpuTensorFilter, FILTER_COLS * FILTER_ROWS * INPUT_CHANNELS * OUTPUT_CHANNELS * sizeof(__half));
+	cudaMalloc(&gpuTensorOutput, OUTPUT_COLS * OUTPUT_ROWS * OUTPUT_CHANNELS * sizeof(__half));
+	cudaMalloc(&gpuTensorQueryWeights, ATTENTION_DIMENTION * OUTPUT_CHANNELS * sizeof(__half));
+	cudaMalloc(&gpuTensorQueries, ATTENTION_DIMENTION * OUTPUT_COLS * OUTPUT_ROWS * sizeof(__half));
+	
+	__half* cpuTensorInput = new __half[INPUT_COLS * INPUT_ROWS * INPUT_CHANNELS];
+	__half* cpuTensorFilter = new __half[FILTER_COLS * FILTER_ROWS * INPUT_CHANNELS * OUTPUT_CHANNELS];
+	__half* cpuTensorOutput = new __half[OUTPUT_COLS * OUTPUT_ROWS * OUTPUT_CHANNELS];
+	__half* cpuTensorQueryWeights = new __half[ATTENTION_DIMENTION * OUTPUT_CHANNELS];
+	__half* cpuTensorQueries = new __half[ATTENTION_DIMENTION * OUTPUT_COLS * OUTPUT_ROWS];
 
-	cudaMemcpy(cpuInput, gpuInput, INPUT_COLS * INPUT_ROWS * INPUT_CHANNELS * sizeof(__half), cudaMemcpyDeviceToHost);
-
-	PrintMatrixF16(cpuInput, INPUT_ROWS, INPUT_COLS, "cpuInput");
+	CurandGenerateUniformF16(curandGenerator, gpuTensorInput, INPUT_COLS * INPUT_ROWS * INPUT_CHANNELS);
+	CurandGenerateUniformF16(curandGenerator, gpuTensorFilter, FILTER_COLS * FILTER_ROWS * INPUT_CHANNELS * OUTPUT_CHANNELS);
+	CurandGenerateUniformF16(curandGenerator, gpuTensorQueryWeights, ATTENTION_DIMENTION * OUTPUT_CHANNELS);
+	
+	cudaMemcpy(cpuTensorInput, gpuTensorInput, INPUT_COLS * INPUT_ROWS * INPUT_CHANNELS * sizeof(__half), cudaMemcpyDeviceToHost);
+	cudaMemcpy(cpuTensorFilter, gpuTensorFilter, FILTER_COLS * FILTER_ROWS * INPUT_CHANNELS * OUTPUT_CHANNELS * sizeof(__half), cudaMemcpyDeviceToHost);
+	cudaMemcpy(cpuTensorQueryWeights, gpuTensorQueryWeights, ATTENTION_DIMENTION * OUTPUT_CHANNELS * sizeof(__half), cudaMemcpyDeviceToHost);
+	
+	PrintMatrixF16(cpuTensorInput, INPUT_ROWS, INPUT_COLS, "cpuTensorInput");
 	
 	for (uint32_t i = 0; i < OUTPUT_CHANNELS; i++)
 	{
-		printf("cpuFilter[%d]:\n", i);
-		PrintMatrixF16(cpuFilter + i * FILTER_COLS * FILTER_ROWS * INPUT_CHANNELS, FILTER_ROWS, FILTER_COLS, "cpuFilter");
+		printf("cpuTensorFilter[%d]:\n", i);
+		PrintMatrixF16(cpuTensorFilter + i * FILTER_COLS * FILTER_ROWS * INPUT_CHANNELS, FILTER_ROWS, FILTER_COLS, "cpuTensorFilter");
 	}
 
-	cudnnTensorDescriptor_t input_descriptor;
-	cudnnTensorDescriptor_t output_descriptor;
-	cudnnFilterDescriptor_t kernel_descriptor;
-	cudnnConvolutionDescriptor_t convolution_descriptor;
+	cudnnTensorDescriptor_t inputTensorDescriptor;
+	cudnnTensorDescriptor_t outputTensorDescriptor;
+	cudnnFilterDescriptor_t kernelTensorDescriptor;
+	cudnnConvolutionDescriptor_t convolutionDescriptor;
 
-	cudnnCreateTensorDescriptor(&input_descriptor);
-	cudnnCreateTensorDescriptor(&output_descriptor);
-	cudnnCreateFilterDescriptor(&kernel_descriptor);
-	cudnnCreateConvolutionDescriptor(&convolution_descriptor);
+	cudnnCreateTensorDescriptor(&inputTensorDescriptor);
+	cudnnCreateTensorDescriptor(&outputTensorDescriptor);
+	cudnnCreateFilterDescriptor(&kernelTensorDescriptor);
+	cudnnCreateConvolutionDescriptor(&convolutionDescriptor);
 
-	cudnnSetTensor4dDescriptor(input_descriptor, CUDNN_TENSOR_NHWC, CUDNN_DATA_HALF, BATCH_SIZE, INPUT_CHANNELS, INPUT_ROWS, INPUT_COLS);
-	cudnnSetTensor4dDescriptor(output_descriptor, CUDNN_TENSOR_NHWC, CUDNN_DATA_HALF, BATCH_SIZE, OUTPUT_CHANNELS, OUTPUT_ROWS, OUTPUT_COLS);
-	cudnnSetFilter4dDescriptor(kernel_descriptor, CUDNN_DATA_HALF, CUDNN_TENSOR_NHWC, OUTPUT_CHANNELS, INPUT_CHANNELS, FILTER_ROWS, FILTER_COLS);
-	cudnnSetConvolution2dDescriptor(convolution_descriptor, PADDING, PADDING, STRIDE, STRIDE, DILATION, DILATION, CUDNN_CROSS_CORRELATION, CUDNN_DATA_HALF);
+	cudnnSetTensor4dDescriptor(inputTensorDescriptor, CUDNN_TENSOR_NHWC, CUDNN_DATA_HALF, BATCH_SIZE, INPUT_CHANNELS, INPUT_ROWS, INPUT_COLS);
+	cudnnSetTensor4dDescriptor(outputTensorDescriptor, CUDNN_TENSOR_NHWC, CUDNN_DATA_HALF, BATCH_SIZE, OUTPUT_CHANNELS, OUTPUT_ROWS, OUTPUT_COLS);
+	cudnnSetFilter4dDescriptor(kernelTensorDescriptor, CUDNN_DATA_HALF, CUDNN_TENSOR_NHWC, OUTPUT_CHANNELS, INPUT_CHANNELS, FILTER_ROWS, FILTER_COLS);
+	cudnnSetConvolution2dDescriptor(convolutionDescriptor, PADDING, PADDING, STRIDE, STRIDE, DILATION, DILATION, CUDNN_CROSS_CORRELATION, CUDNN_DATA_HALF);
 
-	cudnnConvolutionFwdAlgo_t forwardPropagationAlgorithm;
 	int maxPropagationAlgorithms;
 	cudnnGetConvolutionForwardAlgorithmMaxCount(cudnnHandle, &maxPropagationAlgorithms);
 	cudnnConvolutionFwdAlgoPerf_t* forwardPropagationAlgorithms = new cudnnConvolutionFwdAlgoPerf_t[maxPropagationAlgorithms];
-	cudnnFindConvolutionForwardAlgorithm(cudnnHandle, input_descriptor, kernel_descriptor, convolution_descriptor, output_descriptor, maxPropagationAlgorithms, &maxPropagationAlgorithms, forwardPropagationAlgorithms);
-	forwardPropagationAlgorithm = forwardPropagationAlgorithms[0].algo;
+	cudnnFindConvolutionForwardAlgorithm(cudnnHandle, inputTensorDescriptor, kernelTensorDescriptor, convolutionDescriptor, outputTensorDescriptor, maxPropagationAlgorithms, &maxPropagationAlgorithms, forwardPropagationAlgorithms);
+	cudnnConvolutionFwdAlgo_t forwardPropagationAlgorithm = forwardPropagationAlgorithms[0].algo;
 	delete[] forwardPropagationAlgorithms;
 	printf("Forward propagation algorithm: %d\n\n", forwardPropagationAlgorithm);
 
 	size_t workspaceBytes = 0;
-	cudnnGetConvolutionForwardWorkspaceSize(cudnnHandle, input_descriptor, kernel_descriptor, convolution_descriptor, output_descriptor, forwardPropagationAlgorithm, &workspaceBytes);
+	cudnnGetConvolutionForwardWorkspaceSize(cudnnHandle, inputTensorDescriptor, kernelTensorDescriptor, convolutionDescriptor, outputTensorDescriptor, forwardPropagationAlgorithm, &workspaceBytes);
 	void* workspace;
 	cudaMalloc(&workspace, workspaceBytes);
 
-	const float alpha = 1.0f;
-	const float beta = 0.0f;
-	cudnnConvolutionForward(cudnnHandle, &alpha, input_descriptor, gpuInput, kernel_descriptor, gpuFilter, convolution_descriptor, forwardPropagationAlgorithm, workspace, workspaceBytes, &beta, output_descriptor, gpuOutput);
+	cudnnConvolutionForward(cudnnHandle, &alpha, inputTensorDescriptor, gpuTensorInput, kernelTensorDescriptor, gpuTensorFilter, convolutionDescriptor, forwardPropagationAlgorithm, workspace, workspaceBytes, &beta, outputTensorDescriptor, gpuTensorOutput);
 
-	cudaMemcpy(cpuOutput, gpuOutput, OUTPUT_COLS * OUTPUT_ROWS * OUTPUT_CHANNELS * sizeof(__half), cudaMemcpyDeviceToHost);
+	cudaMemcpy(cpuTensorOutput, gpuTensorOutput, OUTPUT_COLS * OUTPUT_ROWS * OUTPUT_CHANNELS * sizeof(__half), cudaMemcpyDeviceToHost);
 	
 	for (uint32_t i = 0; i < OUTPUT_CHANNELS; i++)
 	{
-		printf("cpuOutput[%d]:\n", i);
-		PrintMatrixF16(cpuOutput + i * OUTPUT_COLS * OUTPUT_ROWS, OUTPUT_ROWS, OUTPUT_COLS, "cpuOutput");
+		printf("cpuTensorOutput[%d]:\n", i);
+		PrintMatrixF16(cpuTensorOutput + i * OUTPUT_COLS * OUTPUT_ROWS, OUTPUT_ROWS, OUTPUT_COLS, "cpuTensorOutput");
 	}
+	
+	PrintMatrixF16(cpuTensorOutput, OUTPUT_CHANNELS, OUTPUT_COLS * OUTPUT_ROWS, "cpuTensorOutput");
+	PrintMatrixF16(cpuTensorQueryWeights, OUTPUT_CHANNELS, ATTENTION_DIMENTION, "cpuTensorQueryWeights");
+	
+	const __half alphaf16 = __float2half(1.0f);
+	const __half betaf16 = __float2half(0.0f);
+	
+	cublasGemmStridedBatchedEx
+	(
+		cublasHandle, CUBLAS_OP_N, CUBLAS_OP_T,
+		ATTENTION_DIMENTION, OUTPUT_COLS * OUTPUT_ROWS, OUTPUT_CHANNELS,
+		&alphaf16,
+		gpuTensorQueryWeights, CUDA_R_16F, ATTENTION_DIMENTION, 0,
+		gpuTensorOutput, CUDA_R_16F, OUTPUT_COLS * OUTPUT_ROWS, 0,
+		&betaf16,
+		gpuTensorQueries, CUDA_R_16F, ATTENTION_DIMENTION, 0,
+		BATCH_SIZE, CUDA_R_16F, CUBLAS_GEMM_DEFAULT
+	);
+
+	cudaMemcpy(cpuTensorQueries, gpuTensorQueries, ATTENTION_DIMENTION * OUTPUT_COLS * OUTPUT_ROWS * sizeof(__half), cudaMemcpyDeviceToHost);
+	
+	PrintMatrixF16(cpuTensorQueries, OUTPUT_COLS * OUTPUT_ROWS, ATTENTION_DIMENTION, "cpuTensorQueries");
 	
 	return 0;
 }
