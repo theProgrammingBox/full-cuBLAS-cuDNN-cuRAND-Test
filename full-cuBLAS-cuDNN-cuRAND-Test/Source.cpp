@@ -46,6 +46,8 @@ int main()
 	curandCreateGenerator(&curandGenerator, CURAND_RNG_PSEUDO_DEFAULT);
 	curandSetPseudoRandomGeneratorSeed(curandGenerator, 1234ULL);
 
+	const uint32_t BATCH_SIZE = 1;
+
 	const uint32_t INPUT_CHANNELS = 1;
 	const uint32_t INPUT_ROWS = 16;
 	const uint32_t INPUT_COLS = 16;
@@ -61,39 +63,34 @@ int main()
 	const uint32_t STRIDE = 4;
 	const uint32_t DILATION = 1;
 
-	__half* mat1GPU;
-	__half* mat2GPU;
-	__half* mat3GPU;
-	__half* filterGPU;
-	__half* mat4GPU;
+	__half* gpuVec1;
+	__half* gpuVec2;
+	__half* gpuInput;
+	__half* gpuFilter;
+	__half* gpuOutput;
 	
-	cudaMalloc(&mat1GPU, INPUT_ROWS << 1);
-	cudaMalloc(&mat2GPU, INPUT_COLS << 1);
-	cudaMalloc(&mat3GPU, INPUT_ROWS * INPUT_COLS << 1);
-	cudaMalloc(&filterGPU, FILTER_ROWS * FILTER_COLS * INPUT_CHANNELS * OUTPUT_CHANNELS << 1);
-	cudaMalloc(&mat4GPU, OUTPUT_ROWS * OUTPUT_COLS * OUTPUT_CHANNELS << 1);
+	cudaMalloc(&gpuVec1, INPUT_ROWS * sizeof(__half));
+	cudaMalloc(&gpuVec2, INPUT_COLS * sizeof(__half));
+	cudaMalloc(&gpuInput, INPUT_COLS * INPUT_ROWS * INPUT_CHANNELS * sizeof(__half));
+	cudaMalloc(&gpuFilter, FILTER_COLS * FILTER_ROWS * INPUT_CHANNELS * OUTPUT_CHANNELS * sizeof(__half));
+	cudaMalloc(&gpuOutput, OUTPUT_COLS * OUTPUT_ROWS * OUTPUT_CHANNELS * sizeof(__half));
 
-	__half* mat1CPU = (__half*)malloc(INPUT_ROWS << 1);
-	__half* mat2CPU = (__half*)malloc(INPUT_COLS << 1);
-	__half* mat3CPU = (__half*)malloc(INPUT_ROWS * INPUT_COLS << 1);
-	__half* filterCPU = (__half*)malloc(FILTER_ROWS * FILTER_COLS * INPUT_CHANNELS * OUTPUT_CHANNELS << 1);
-	__half* mat4CPU = (__half*)malloc(OUTPUT_ROWS * OUTPUT_COLS * OUTPUT_CHANNELS << 1);
+	__half* cpuVec1 = new __half[INPUT_ROWS];
+	__half* cpuVec2 = new __half[INPUT_COLS];
+	__half* cpuInput = new __half[INPUT_COLS * INPUT_ROWS * INPUT_CHANNELS];
+	__half* cpuFilter = new __half[FILTER_COLS * FILTER_ROWS * INPUT_CHANNELS * OUTPUT_CHANNELS];
+	__half* cpuOutput = new __half[OUTPUT_COLS * OUTPUT_ROWS * OUTPUT_CHANNELS];
 
-	CurandGenerateUniformF16(curandGenerator, mat1GPU, INPUT_ROWS);
-	CurandGenerateUniformF16(curandGenerator, mat2GPU, INPUT_COLS);
-	CurandGenerateUniformF16(curandGenerator, filterGPU, FILTER_ROWS * FILTER_COLS * INPUT_CHANNELS * OUTPUT_CHANNELS);
+	CurandGenerateUniformF16(curandGenerator, gpuVec1, INPUT_ROWS);
+	CurandGenerateUniformF16(curandGenerator, gpuVec2, INPUT_COLS);
+	CurandGenerateUniformF16(curandGenerator, gpuFilter, FILTER_COLS * FILTER_ROWS * INPUT_CHANNELS * OUTPUT_CHANNELS);
 
-	cudaMemcpy(mat1CPU, mat1GPU, INPUT_ROWS << 1, cudaMemcpyDeviceToHost);
-	cudaMemcpy(mat2CPU, mat2GPU, INPUT_COLS << 1, cudaMemcpyDeviceToHost);
-	cudaMemcpy(filterCPU, filterGPU, FILTER_ROWS * FILTER_COLS * INPUT_CHANNELS * OUTPUT_CHANNELS << 1, cudaMemcpyDeviceToHost);
+	cudaMemcpy(cpuVec1, gpuVec1, INPUT_ROWS * sizeof(__half), cudaMemcpyDeviceToHost);
+	cudaMemcpy(cpuVec2, gpuVec2, INPUT_COLS * sizeof(__half), cudaMemcpyDeviceToHost);
+	cudaMemcpy(cpuFilter, gpuFilter, FILTER_COLS * FILTER_ROWS * INPUT_CHANNELS * OUTPUT_CHANNELS * sizeof(__half), cudaMemcpyDeviceToHost);
 
-	PrintMatrixF16(mat1CPU, INPUT_ROWS, 1, "mat1CPU");
-	PrintMatrixF16(mat2CPU, 1, INPUT_COLS, "mat2CPU");
-	for (uint32_t i = 0; i < OUTPUT_CHANNELS; i++)
-	{
-		printf("filterCPU[%d]:\n", i);
-		PrintMatrixF16(filterCPU + i * FILTER_ROWS * FILTER_COLS * INPUT_CHANNELS, FILTER_ROWS, FILTER_COLS, "");
-	}
+	PrintMatrixF16(cpuVec1, INPUT_ROWS, 1, "cpuVec1");
+	PrintMatrixF16(cpuVec2, 1, INPUT_COLS, "cpuVec2");
 	
 	const __half alphaF16 = __float2half(1.0f);
 	const __half betaF16 = __float2half(0.0f);
@@ -103,92 +100,62 @@ int main()
 		cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N,
 		INPUT_COLS, INPUT_ROWS, 1,
 		&alphaF16,
-		mat2GPU, CUDA_R_16F, INPUT_COLS, INPUT_COLS,
-		mat1GPU, CUDA_R_16F, 1, INPUT_ROWS,
+		gpuVec2, CUDA_R_16F, INPUT_COLS, INPUT_COLS,
+		gpuVec1, CUDA_R_16F, 1, INPUT_ROWS,
 		&betaF16,
-		mat3GPU, CUDA_R_16F, INPUT_COLS, INPUT_ROWS * INPUT_COLS,
+		gpuInput, CUDA_R_16F, INPUT_COLS, INPUT_ROWS * INPUT_COLS,
 		1, CUDA_R_16F, CUBLAS_GEMM_DEFAULT
 	);
 
-	cudaMemcpy(mat3CPU, mat3GPU, INPUT_ROWS * INPUT_COLS << 1, cudaMemcpyDeviceToHost);
+	cudaMemcpy(cpuInput, gpuInput, INPUT_COLS * INPUT_ROWS * INPUT_CHANNELS * sizeof(__half), cudaMemcpyDeviceToHost);
 
-	PrintMatrixF16(mat3CPU, INPUT_ROWS, INPUT_COLS, "mat3CPU");
-
-	cudnnTensorDescriptor_t inputDescriptor;
-	cudnnCreateTensorDescriptor(&inputDescriptor);
-	cudnnSetTensor4dDescriptor
-	(
-		inputDescriptor, CUDNN_TENSOR_NHWC, CUDNN_DATA_HALF,
-		1, INPUT_CHANNELS, INPUT_ROWS, INPUT_COLS
-	);
-
-	cudnnTensorDescriptor_t outputDescriptor;
-	cudnnCreateTensorDescriptor(&outputDescriptor);
-	cudnnSetTensor4dDescriptor
-	(
-		outputDescriptor, CUDNN_TENSOR_NHWC, CUDNN_DATA_HALF,
-		1, OUTPUT_CHANNELS, OUTPUT_ROWS, OUTPUT_COLS
-	);
-
-	cudnnFilterDescriptor_t filterDescriptor;
-	cudnnCreateFilterDescriptor(&filterDescriptor);
-	cudnnSetFilter4dDescriptor
-	(
-		filterDescriptor, CUDNN_DATA_HALF, CUDNN_TENSOR_NHWC,
-		OUTPUT_CHANNELS, INPUT_CHANNELS, FILTER_ROWS, FILTER_COLS
-	);
-
-	cudnnConvolutionDescriptor_t convolutionDescriptor;
-	cudnnCreateConvolutionDescriptor(&convolutionDescriptor);
-	cudnnSetConvolution2dDescriptor
-	(
-		convolutionDescriptor,
-		PADDING, PADDING,
-		STRIDE, STRIDE,
-		DILATION, DILATION,
-		CUDNN_CROSS_CORRELATION, CUDNN_DATA_HALF
-	);
-
-	int maxPropagationAlgorithms;
-	cudnnGetConvolutionForwardAlgorithmMaxCount(cudnnHandle, &maxPropagationAlgorithms);
-	cudnnConvolutionFwdAlgoPerf_t* forwardPropagationAlgorithms = new cudnnConvolutionFwdAlgoPerf_t[maxPropagationAlgorithms];
-	cudnnFindConvolutionForwardAlgorithm
-	(
-		cudnnHandle,
-		inputDescriptor, filterDescriptor, convolutionDescriptor, outputDescriptor,
-		maxPropagationAlgorithms, &maxPropagationAlgorithms, forwardPropagationAlgorithms
-	);
-	cudnnConvolutionFwdAlgo_t forwardConvolutionAlgorithm = forwardPropagationAlgorithms[0].algo;
-	delete[] forwardPropagationAlgorithms;
-
-	size_t forwardWorkspaceSize;
-	cudnnGetConvolutionForwardWorkspaceSize
-	(
-		cudnnHandle,
-		inputDescriptor, filterDescriptor, convolutionDescriptor, outputDescriptor,
-		forwardConvolutionAlgorithm, &forwardWorkspaceSize
-	);
-	void* forwardWorkspace;
-	cudaMalloc(&forwardWorkspace, forwardWorkspaceSize);
-
-	cudnnConvolutionForward
-	(
-		cudnnHandle,
-		&alphaF16,
-		inputDescriptor, mat3GPU,
-		filterDescriptor, filterGPU,
-		convolutionDescriptor, forwardConvolutionAlgorithm,
-		forwardWorkspace, forwardWorkspaceSize,
-		&betaF16,
-		outputDescriptor, mat4GPU
-	);
-
-	cudaMemcpy(mat4CPU, mat4GPU, OUTPUT_ROWS * OUTPUT_COLS * OUTPUT_CHANNELS << 1, cudaMemcpyDeviceToHost);
+	PrintMatrixF16(cpuInput, INPUT_ROWS, INPUT_COLS, "cpuInput");
 	
 	for (uint32_t i = 0; i < OUTPUT_CHANNELS; i++)
 	{
-		printf("mat4CPU[%d]:\n", i);
-		PrintMatrixF16(mat4CPU + i * OUTPUT_ROWS * OUTPUT_COLS, OUTPUT_ROWS, OUTPUT_COLS, "");
+		printf("cpuFilter[%d]:\n", i);
+		PrintMatrixF16(cpuFilter + i * FILTER_COLS * FILTER_ROWS * INPUT_CHANNELS, FILTER_ROWS, FILTER_COLS, "cpuFilter");
+	}
+
+	cudnnTensorDescriptor_t input_descriptor;
+	cudnnTensorDescriptor_t output_descriptor;
+	cudnnFilterDescriptor_t kernel_descriptor;
+	cudnnConvolutionDescriptor_t convolution_descriptor;
+
+	cudnnCreateTensorDescriptor(&input_descriptor);
+	cudnnCreateTensorDescriptor(&output_descriptor);
+	cudnnCreateFilterDescriptor(&kernel_descriptor);
+	cudnnCreateConvolutionDescriptor(&convolution_descriptor);
+
+	cudnnSetTensor4dDescriptor(input_descriptor, CUDNN_TENSOR_NHWC, CUDNN_DATA_HALF, BATCH_SIZE, INPUT_CHANNELS, INPUT_ROWS, INPUT_COLS);
+	cudnnSetTensor4dDescriptor(output_descriptor, CUDNN_TENSOR_NHWC, CUDNN_DATA_HALF, BATCH_SIZE, OUTPUT_CHANNELS, OUTPUT_ROWS, OUTPUT_COLS);
+	cudnnSetFilter4dDescriptor(kernel_descriptor, CUDNN_DATA_HALF, CUDNN_TENSOR_NHWC, OUTPUT_CHANNELS, INPUT_CHANNELS, FILTER_ROWS, FILTER_COLS);
+	cudnnSetConvolution2dDescriptor(convolution_descriptor, PADDING, PADDING, STRIDE, STRIDE, DILATION, DILATION, CUDNN_CROSS_CORRELATION, CUDNN_DATA_HALF);
+
+	cudnnConvolutionFwdAlgo_t forwardPropagationAlgorithm;
+	int maxPropagationAlgorithms;
+	cudnnGetConvolutionForwardAlgorithmMaxCount(cudnnHandle, &maxPropagationAlgorithms);
+	cudnnConvolutionFwdAlgoPerf_t* forwardPropagationAlgorithms = new cudnnConvolutionFwdAlgoPerf_t[maxPropagationAlgorithms];
+	cudnnFindConvolutionForwardAlgorithm(cudnnHandle, input_descriptor, kernel_descriptor, convolution_descriptor, output_descriptor, maxPropagationAlgorithms, &maxPropagationAlgorithms, forwardPropagationAlgorithms);
+	forwardPropagationAlgorithm = forwardPropagationAlgorithms[0].algo;
+	delete[] forwardPropagationAlgorithms;
+	printf("Forward propagation algorithm: %d\n\n", forwardPropagationAlgorithm);
+
+	size_t workspaceBytes = 0;
+	cudnnGetConvolutionForwardWorkspaceSize(cudnnHandle, input_descriptor, kernel_descriptor, convolution_descriptor, output_descriptor, forwardPropagationAlgorithm, &workspaceBytes);
+	void* workspace;
+	cudaMalloc(&workspace, workspaceBytes);
+
+	const float alpha = 1.0f;
+	const float beta = 0.0f;
+	cudnnConvolutionForward(cudnnHandle, &alpha, input_descriptor, gpuInput, kernel_descriptor, gpuFilter, convolution_descriptor, forwardPropagationAlgorithm, workspace, workspaceBytes, &beta, output_descriptor, gpuOutput);
+
+	cudaMemcpy(cpuOutput, gpuOutput, OUTPUT_COLS * OUTPUT_ROWS * OUTPUT_CHANNELS * sizeof(__half), cudaMemcpyDeviceToHost);
+	
+	for (uint32_t i = 0; i < OUTPUT_CHANNELS; i++)
+	{
+		printf("cpuOutput[%d]:\n", i);
+		PrintMatrixF16(cpuOutput + i * OUTPUT_COLS * OUTPUT_ROWS, OUTPUT_ROWS, OUTPUT_COLS, "cpuOutput");
 	}
 	
 	return 0;
