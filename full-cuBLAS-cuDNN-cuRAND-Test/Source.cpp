@@ -12,8 +12,8 @@ IMPORTANT LESSONS
 
 /*
 TODO
-0. Add attention
-1. Optimize using << and storing bytes
+0. Add attention scores
+1. add attention results
 2. Add more convolution before attention
 */
 
@@ -40,6 +40,19 @@ void CurandGenerateUniformF16(curandGenerator_t generator, __half* output, uint3
 {
 	curandGenerate(generator, (uint32_t*)output, (size >> 1) + (size & 1));
 	CurandNormalizeF16 << <std::ceil(0.0009765625f * size), 1024 >> > (output, size, min, (max - min) * 0.0000152590218967f);
+}
+
+__global__ void GpuReluF16(__half* input, __half* output, uint32_t size)
+{
+	uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+	if (index < size && *(uint16_t*)(input + index) >> 15)
+		output[index] = 0x0000;
+}
+
+void ReluF16(__half* input, __half* output, uint32_t size)
+{
+	cudaMemcpy(output, input, size << 1, cudaMemcpyDeviceToDevice);
+	GpuReluF16 << <std::ceil(0.0009765625f * size), 1024 >> > (input, output, size);
 }
 
 int main()
@@ -102,6 +115,7 @@ int main()
 	__half* gpuTensorInput;
 	__half* gpuTensorFilter;
 	__half* gpuTensorOutput;
+	__half* gpuTensorReluOutput;
 	
 	__half* gpuTensorQueryWeights;
 	__half* gpuTensorKeyWeights;
@@ -111,21 +125,23 @@ int main()
 	__half* gpuTensorKeys;
 	__half* gpuTensorValues;
 	
-	cudaMalloc(&gpuTensorInput, TENSOR_INPUT_SIZE * BATCH_SIZE * sizeof(__half));
-	cudaMalloc(&gpuTensorFilter, TENSOR_FILTER_SIZE * sizeof(__half));
-	cudaMalloc(&gpuTensorOutput, TENSOR_OUTPUT_SIZE * BATCH_SIZE * sizeof(__half));
+	cudaMalloc(&gpuTensorInput, TENSOR_INPUT_SIZE * BATCH_SIZE << 1);
+	cudaMalloc(&gpuTensorFilter, TENSOR_FILTER_SIZE << 1);
+	cudaMalloc(&gpuTensorOutput, TENSOR_OUTPUT_SIZE * BATCH_SIZE << 1);
+	cudaMalloc(&gpuTensorReluOutput, TENSOR_OUTPUT_SIZE * BATCH_SIZE << 1);
 	
-	cudaMalloc(&gpuTensorQueryWeights, TENSOR_QUERY_WEIGHTS_SIZE * sizeof(__half));
-	cudaMalloc(&gpuTensorKeyWeights, TENSOR_QUERY_WEIGHTS_SIZE * sizeof(__half));
-	cudaMalloc(&gpuTensorValueWeights, TENSOR_VALUE_WEIGHTS_SIZE * sizeof(__half));
+	cudaMalloc(&gpuTensorQueryWeights, TENSOR_QUERY_WEIGHTS_SIZE << 1);
+	cudaMalloc(&gpuTensorKeyWeights, TENSOR_QUERY_WEIGHTS_SIZE << 1);
+	cudaMalloc(&gpuTensorValueWeights, TENSOR_VALUE_WEIGHTS_SIZE << 1);
 	
-	cudaMalloc(&gpuTensorQueries, TENSOR_QUERIES_SIZE * BATCH_SIZE * sizeof(__half));
-	cudaMalloc(&gpuTensorKeys, TENSOR_QUERIES_SIZE * BATCH_SIZE * sizeof(__half));
-	cudaMalloc(&gpuTensorValues, TENSOR_VALUES_SIZE * BATCH_SIZE * sizeof(__half));
+	cudaMalloc(&gpuTensorQueries, TENSOR_QUERIES_SIZE * BATCH_SIZE << 1);
+	cudaMalloc(&gpuTensorKeys, TENSOR_QUERIES_SIZE * BATCH_SIZE << 1);
+	cudaMalloc(&gpuTensorValues, TENSOR_VALUES_SIZE * BATCH_SIZE << 1);
 	
 	__half* cpuTensorInput = new __half[TENSOR_INPUT_SIZE * BATCH_SIZE];
 	__half* cpuTensorFilter = new __half[TENSOR_FILTER_SIZE];
 	__half* cpuTensorOutput = new __half[TENSOR_OUTPUT_SIZE * BATCH_SIZE];
+	__half* cpuTensorReluOutput = new __half[TENSOR_OUTPUT_SIZE * BATCH_SIZE];
 	
 	__half* cpuTensorQueryWeights = new __half[TENSOR_QUERY_WEIGHTS_SIZE];
 	__half* cpuTensorKeyWeights = new __half[TENSOR_QUERY_WEIGHTS_SIZE];
@@ -142,12 +158,12 @@ int main()
 	CurandGenerateUniformF16(curandGenerator, gpuTensorKeyWeights, TENSOR_QUERY_WEIGHTS_SIZE);
 	CurandGenerateUniformF16(curandGenerator, gpuTensorValueWeights, TENSOR_VALUE_WEIGHTS_SIZE);
 	
-	cudaMemcpy(cpuTensorInput, gpuTensorInput, TENSOR_INPUT_SIZE * BATCH_SIZE * sizeof(__half), cudaMemcpyDeviceToHost);
-	cudaMemcpy(cpuTensorFilter, gpuTensorFilter, TENSOR_FILTER_SIZE * sizeof(__half), cudaMemcpyDeviceToHost);
+	cudaMemcpy(cpuTensorInput, gpuTensorInput, TENSOR_INPUT_SIZE * BATCH_SIZE << 1, cudaMemcpyDeviceToHost);
+	cudaMemcpy(cpuTensorFilter, gpuTensorFilter, TENSOR_FILTER_SIZE << 1, cudaMemcpyDeviceToHost);
 	
-	cudaMemcpy(cpuTensorQueryWeights, gpuTensorQueryWeights, TENSOR_QUERY_WEIGHTS_SIZE * sizeof(__half), cudaMemcpyDeviceToHost);
-	cudaMemcpy(cpuTensorKeyWeights, gpuTensorKeyWeights, TENSOR_QUERY_WEIGHTS_SIZE * sizeof(__half), cudaMemcpyDeviceToHost);
-	cudaMemcpy(cpuTensorValueWeights, gpuTensorValueWeights, TENSOR_VALUE_WEIGHTS_SIZE * sizeof(__half), cudaMemcpyDeviceToHost);
+	cudaMemcpy(cpuTensorQueryWeights, gpuTensorQueryWeights, TENSOR_QUERY_WEIGHTS_SIZE << 1, cudaMemcpyDeviceToHost);
+	cudaMemcpy(cpuTensorKeyWeights, gpuTensorKeyWeights, TENSOR_QUERY_WEIGHTS_SIZE << 1, cudaMemcpyDeviceToHost);
+	cudaMemcpy(cpuTensorValueWeights, gpuTensorValueWeights, TENSOR_VALUE_WEIGHTS_SIZE << 1, cudaMemcpyDeviceToHost);
 	
 	for (uint32_t i = 0; i < BATCH_SIZE; i++)
 	{
@@ -194,7 +210,7 @@ int main()
 
 	cudnnConvolutionForward(cudnnHandle, &alpha, inputTensorDescriptor, gpuTensorInput, kernelTensorDescriptor, gpuTensorFilter, convolutionDescriptor, forwardPropagationAlgorithm, workspace, workspaceBytes, &beta, outputTensorDescriptor, gpuTensorOutput);
 
-	cudaMemcpy(cpuTensorOutput, gpuTensorOutput, TENSOR_OUTPUT_SIZE * BATCH_SIZE * sizeof(__half), cudaMemcpyDeviceToHost);
+	cudaMemcpy(cpuTensorOutput, gpuTensorOutput, TENSOR_OUTPUT_SIZE * BATCH_SIZE << 1, cudaMemcpyDeviceToHost);
 	
 	for (uint32_t i = 0; i < BATCH_SIZE; i++)
 	{
@@ -204,11 +220,24 @@ int main()
 			PrintMatrixF16(cpuTensorOutput + i * TENSOR_OUTPUT_SIZE + j * TENSOR_OUTPUT_AREA, OUTPUT_ROWS, OUTPUT_COLS, "cpuTensorOutput");
 		}
 	}
+
+	ReluF16(gpuTensorOutput, gpuTensorReluOutput, TENSOR_OUTPUT_SIZE * BATCH_SIZE);
+
+	cudaMemcpy(cpuTensorReluOutput, gpuTensorReluOutput, TENSOR_OUTPUT_SIZE * BATCH_SIZE << 1, cudaMemcpyDeviceToHost);
 	
 	for (uint32_t i = 0; i < BATCH_SIZE; i++)
 	{
-		printf("cpuTensorOutput[%d]:\n", i);
-		PrintMatrixF16(cpuTensorOutput + i * TENSOR_OUTPUT_SIZE, OUTPUT_ROWS, OUTPUT_COLS, "cpuTensorOutput");
+		for (uint32_t j = 0; j < OUTPUT_CHANNELS; j++)
+		{
+			printf("cpuTensorReluOutput[%d][%d]:\n", i, j);
+			PrintMatrixF16(cpuTensorReluOutput + i * TENSOR_OUTPUT_SIZE + j * TENSOR_OUTPUT_AREA, OUTPUT_ROWS, OUTPUT_COLS, "cpuTensorReluOutput");
+		}
+	}
+	
+	for (uint32_t i = 0; i < BATCH_SIZE; i++)
+	{
+		printf("cpuTensorReluOutput[%d]:\n", i);
+		PrintMatrixF16(cpuTensorReluOutput + i * TENSOR_OUTPUT_SIZE, OUTPUT_CHANNELS, TENSOR_OUTPUT_AREA, "cpuTensorReluOutput");
 	}
 	
 	PrintMatrixF16(cpuTensorQueryWeights, OUTPUT_CHANNELS, TENSOR_QUERY_DIMENTION, "cpuTensorQueryWeights");
@@ -219,18 +248,62 @@ int main()
 		TENSOR_QUERY_DIMENTION, TENSOR_OUTPUT_AREA, OUTPUT_CHANNELS,
 		&alphaf16,
 		gpuTensorQueryWeights, CUDA_R_16F, TENSOR_QUERY_DIMENTION, TENSOR_QUERY_WEIGHTS_SIZE,
-		gpuTensorOutput, CUDA_R_16F, TENSOR_OUTPUT_AREA, TENSOR_OUTPUT_SIZE,
+		gpuTensorReluOutput, CUDA_R_16F, TENSOR_OUTPUT_AREA, TENSOR_OUTPUT_SIZE,
 		&betaf16,
 		gpuTensorQueries, CUDA_R_16F, TENSOR_QUERY_DIMENTION, TENSOR_QUERIES_SIZE,
 		BATCH_SIZE, CUDA_R_16F, CUBLAS_GEMM_DEFAULT
 	);
 
-	cudaMemcpy(cpuTensorQueries, gpuTensorQueries, TENSOR_QUERIES_SIZE * BATCH_SIZE * sizeof(__half), cudaMemcpyDeviceToHost);
+	cudaMemcpy(cpuTensorQueries, gpuTensorQueries, TENSOR_QUERIES_SIZE * BATCH_SIZE << 1, cudaMemcpyDeviceToHost);
 	
 	for (uint32_t i = 0; i < BATCH_SIZE; i++)
 	{
 		printf("cpuTensorQueries[%d]:\n", i);
 		PrintMatrixF16(cpuTensorQueries + i * TENSOR_QUERIES_SIZE, TENSOR_OUTPUT_AREA, TENSOR_QUERY_DIMENTION, "cpuTensorQueries");
+	}
+
+	PrintMatrixF16(cpuTensorKeyWeights, OUTPUT_CHANNELS, TENSOR_QUERY_DIMENTION, "cpuTensorKeyWeights");
+
+	cublasGemmStridedBatchedEx
+	(
+		cublasHandle, CUBLAS_OP_N, CUBLAS_OP_T,
+		TENSOR_QUERY_DIMENTION, TENSOR_OUTPUT_AREA, OUTPUT_CHANNELS,
+		&alphaf16,
+		gpuTensorKeyWeights, CUDA_R_16F, TENSOR_QUERY_DIMENTION, TENSOR_QUERY_WEIGHTS_SIZE,
+		gpuTensorReluOutput, CUDA_R_16F, TENSOR_OUTPUT_AREA, TENSOR_OUTPUT_SIZE,
+		&betaf16,
+		gpuTensorKeys, CUDA_R_16F, TENSOR_QUERY_DIMENTION, TENSOR_QUERIES_SIZE,
+		BATCH_SIZE, CUDA_R_16F, CUBLAS_GEMM_DEFAULT
+	);
+
+	cudaMemcpy(cpuTensorKeys, gpuTensorKeys, TENSOR_QUERIES_SIZE * BATCH_SIZE << 1, cudaMemcpyDeviceToHost);
+	
+	for (uint32_t i = 0; i < BATCH_SIZE; i++)
+	{
+		printf("cpuTensorKeys[%d]:\n", i);
+		PrintMatrixF16(cpuTensorKeys + i * TENSOR_QUERIES_SIZE, TENSOR_OUTPUT_AREA, TENSOR_QUERY_DIMENTION, "cpuTensorKeys");
+	}
+
+	PrintMatrixF16(cpuTensorValueWeights, OUTPUT_CHANNELS, TENSOR_VALUE_DIMENTION, "cpuTensorValueWeights");
+	
+	cublasGemmStridedBatchedEx
+	(
+		cublasHandle, CUBLAS_OP_N, CUBLAS_OP_T,
+		TENSOR_VALUE_DIMENTION, TENSOR_OUTPUT_AREA, OUTPUT_CHANNELS,
+		&alphaf16,
+		gpuTensorValueWeights, CUDA_R_16F, TENSOR_VALUE_DIMENTION, TENSOR_VALUE_WEIGHTS_SIZE,
+		gpuTensorReluOutput, CUDA_R_16F, TENSOR_OUTPUT_AREA, TENSOR_OUTPUT_SIZE,
+		&betaf16,
+		gpuTensorValues, CUDA_R_16F, TENSOR_VALUE_DIMENTION, TENSOR_VALUES_SIZE,
+		BATCH_SIZE, CUDA_R_16F, CUBLAS_GEMM_DEFAULT
+	);
+
+	cudaMemcpy(cpuTensorValues, gpuTensorValues, TENSOR_VALUES_SIZE * BATCH_SIZE << 1, cudaMemcpyDeviceToHost);
+	
+	for (uint32_t i = 0; i < BATCH_SIZE; i++)
+	{
+		printf("cpuTensorValues[%d]:\n", i);
+		PrintMatrixF16(cpuTensorValues + i * TENSOR_VALUES_SIZE, TENSOR_OUTPUT_AREA, TENSOR_VALUE_DIMENTION, "cpuTensorValues");
 	}
 	
 	return 0;
